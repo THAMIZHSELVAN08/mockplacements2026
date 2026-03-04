@@ -1,6 +1,7 @@
 // src/routes/volunteer.ts
 import express from "express";
 import bcrypt from "bcryptjs";
+import { AssignmentIdParamSchema } from "../schemas";
 import { registry } from "../openapi";
 import { auth, checkRole } from "../middleware/auth";
 import { validate } from "../middleware/validate";
@@ -11,6 +12,7 @@ import {
   CancelAssignmentResponseSchema,
   CancelAssignmentParam,
 } from "../schemas";
+import { InterviewStatus } from "@prisma/client";
 import prisma from "../lib/prisma";
 const router = express.Router();
 import z from "zod";
@@ -223,6 +225,91 @@ router.patch(
     }
   },
 );
+
+// ── ADD THIS ROUTE to src/routes/volunteer.ts ────────────────────────────────
+// Place it alongside the existing volunteer routes.
+// Volunteers can mark a student as no-show for assignments belonging to their HR.
+
+router.post(
+  "/no-show/:assignmentId",
+  auth,
+  checkRole(["VOLUNTEER"]),
+  validate(AssignmentIdParamSchema, "params"),
+  async (req, res) => {
+    const { assignmentId } = req.params;
+
+    try {
+      if (!req.user) {
+        return res.status(401).json({ message: "Unauthorized" });
+      }
+
+      // 1️⃣ Get volunteer's assigned HR
+      const volunteer = await prisma.volunteerProfile.findUnique({
+        where: { id: req.user.id },
+        select: { assignedHrId: true },
+      });
+
+      if (!volunteer?.assignedHrId) {
+        return res.status(403).json({
+          message: "No HR assigned to this volunteer",
+        });
+      }
+
+      // 2️⃣ Fetch assignment
+      const assignment = await prisma.hrAssignment.findUnique({
+        where: { id: Number(assignmentId) },
+      });
+
+      if (!assignment) {
+        return res.status(404).json({
+          message: "Assignment not found",
+        });
+      }
+
+      // 3️⃣ Check ownership
+      if (assignment.hrId !== volunteer.assignedHrId) {
+        return res.status(403).json({
+          message: "Not authorised to modify this assignment",
+        });
+      }
+
+      // 4️⃣ Prevent overwrite of completed
+      if (assignment.status === InterviewStatus.COMPLETED) {
+        return res.status(409).json({
+          message: "Cannot mark a completed interview as no-show",
+        });
+      }
+
+      await prisma.hrAssignment.update({
+        where: { id: assignment.id },
+        data: { status: InterviewStatus.NO_SHOW },
+      });
+
+      res.json({ message: "Marked as no-show" });
+    } catch (err) {
+      console.error(err);
+      res.status(500).send("Server Error");
+    }
+  },
+);
+// OpenAPI registration (add alongside your existing registry.registerPath calls)
+registry.registerPath({
+  method: "post",
+  path: "/api/volunteer/no-show/{assignmentId}",
+  tags: ["Volunteer"],
+  security: [{ bearerAuth: [] }],
+  description:
+    "Mark a student as no-show. Volunteer must belong to the HR who owns the assignment. Cannot overwrite a COMPLETED status.",
+  request: {
+    params: AssignmentIdParamSchema,
+  },
+  responses: {
+    200: { description: "Marked as no-show" },
+    403: { description: "Not authorised to modify this assignment" },
+    404: { description: "Assignment not found" },
+    409: { description: "Interview already completed" },
+  },
+});
 //Create a feature for changing order of students
 export default router;
 
